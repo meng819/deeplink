@@ -314,27 +314,99 @@ async function memoryList() {
   return await res.json();
 }
 
+// GitHub 写文件接口（GET，AI 通过 web_fetch 可调用！终于全自动了）
+app.get('/gh', async (req, res) => {
+  const { path, content, message } = req.query;
+  if (!path || !content) {
+    return res.status(400).json({ error: '需要 path 和 content 参数' });
+  }
+  try {
+    const branch = 'main';
+    const repo = 'deeplink';
+    // 获取最新 commit
+    const ref = await gh('GET', `/repos/${GITHUB_OWNER}/${repo}/git/ref/heads/${branch}`);
+    const latestCommit = await gh('GET', `/repos/${GITHUB_OWNER}/${repo}/git/commits/${ref.object.sha}`);
+    // 创建 blob
+    const blob = await gh('POST', `/repos/${GITHUB_OWNER}/${repo}/git/blobs`, {
+      content: decodeURIComponent(content),
+      encoding: 'utf-8',
+    });
+    // 创建 tree
+    const newTree = await gh('POST', `/repos/${GITHUB_OWNER}/${repo}/git/trees`, {
+      base_tree: latestCommit.tree.sha,
+      tree: [{ path: decodeURIComponent(path), mode: '100644', type: 'blob', sha: blob.sha }],
+    });
+    // 创建 commit
+    const newCommit = await gh('POST', `/repos/${GITHUB_OWNER}/${repo}/git/commits`, {
+      message: decodeURIComponent(message || 'DeepSeek 全自动提交'),
+      tree: newTree.sha,
+      parents: [latestCommit.sha],
+    });
+    // 更新分支
+    await gh('PATCH', `/repos/${GITHUB_OWNER}/${repo}/git/refs/heads/${branch}`, { sha: newCommit.sha });
+    res.json({ success: true, commit: newCommit.sha, path: decodeURIComponent(path) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 记忆库 HTTP 接口（GET，AI 通过 web_fetch 可调用）
 app.get('/memory', async (req, res) => {
-  const { key, value, action } = req.query;
+  const { key, value, action, level } = req.query;
   try {
+    // 列出记忆，默认只列核心，加 all=true 列全部
     if (action === 'list') {
       const data = await memoryList();
-      return res.json({ success: true, data });
+      const all = req.query.all === 'true';
+      let filtered = data;
+      if (!all) {
+        filtered = data.filter(d => d.key.startsWith('core_'));
+      }
+      return res.json({ success: true, count: filtered.length, data: filtered });
     }
+
+    // 删除单条
     if (action === 'delete') {
       if (!key) return res.status(400).json({ error: '需要 key' });
       await memoryDelete(key);
       return res.json({ success: true });
     }
-    if (value) {
-      await memorySet(key, value);
-      return res.json({ success: true, action: 'saved', key, value });
+
+    // 压缩：将所有 norm_ 记忆合并成一条
+    if (action === 'compress') {
+      const all = await memoryList();
+      const norms = all.filter(d => d.key.startsWith('norm_'));
+      if (norms.length === 0) return res.json({ success: true, message: '没有需要压缩的普通记忆' });
+      const summary = norms.map(d => `${d.key.replace('norm_','')}: ${d.value}`).join(' | ');
+      // 删除所有 norm_ 记录
+      for (const n of norms) await memoryDelete(n.key);
+      // 写入合并后的记录
+      await memorySet('core_压缩摘要_' + new Date().toISOString().slice(0,10), summary);
+      return res.json({ success: true, compressed: norms.length, summary });
     }
+
+    // 清理：删除所有 temp_ 记录
+    if (action === 'cleanup') {
+      const all = await memoryList();
+      const temps = all.filter(d => d.key.startsWith('temp_'));
+      for (const t of temps) await memoryDelete(t.key);
+      return res.json({ success: true, deleted: temps.length });
+    }
+
+    // 写记忆（支持 level 参数自动加前缀）
+    if (value) {
+      const prefix = level === 'core' ? 'core_' : level === 'norm' ? 'norm_' : level === 'temp' ? 'temp_' : '';
+      const finalKey = prefix ? prefix + key : key;
+      await memorySet(finalKey, value);
+      return res.json({ success: true, action: 'saved', key: finalKey, value, level: level || 'default' });
+    }
+
+    // 读记忆
     if (key) {
       const val = await memoryGet(key);
       return res.json({ success: true, key, value: val });
     }
+
     res.status(400).json({ error: '需要 key 或 action 参数' });
   } catch (err) {
     res.status(500).json({ error: err.message });
