@@ -264,6 +264,83 @@ app.all('/mcp', async (req, res) => {
   await transport.handleRequest(req, res, body);
 });
 
+// Supabase 配置（从环境变量读取）
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://notkmhfkdhpbfnwsgcwl.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_1nU61MBGaBcJWB6sATWaxQ_cyalHUea';
+
+// 记忆库操作封装
+async function memoryGet(key) {
+  const url = `${SUPABASE_URL}/rest/v1/memories?key=eq.${encodeURIComponent(key)}&select=value`;
+  const res = await fetch(url, { headers: { apikey: SUPABASE_KEY } });
+  const data = await res.json();
+  return data.length > 0 ? data[0].value : null;
+}
+
+async function memorySet(key, value) {
+  // 先检查是否存在
+  const existing = await memoryGet(key);
+  if (existing !== null) {
+    // 更新
+    const url = `${SUPABASE_URL}/rest/v1/memories?key=eq.${encodeURIComponent(key)}`;
+    await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', apikey: SUPABASE_KEY, Prefer: 'return=minimal' },
+      body: JSON.stringify({ value, updated_at: new Date().toISOString() }),
+    });
+  } else {
+    // 插入
+    const url = `${SUPABASE_URL}/rest/v1/memories`;
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey: SUPABASE_KEY, Prefer: 'return=minimal' },
+      body: JSON.stringify({ key, value }),
+    });
+  }
+  return true;
+}
+
+async function memoryDelete(key) {
+  const url = `${SUPABASE_URL}/rest/v1/memories?key=eq.${encodeURIComponent(key)}`;
+  await fetch(url, {
+    method: 'DELETE',
+    headers: { apikey: SUPABASE_KEY },
+  });
+  return true;
+}
+
+async function memoryList() {
+  const url = `${SUPABASE_URL}/rest/v1/memories?select=key,value,updated_at&order=updated_at.desc`;
+  const res = await fetch(url, { headers: { apikey: SUPABASE_KEY } });
+  return await res.json();
+}
+
+// 记忆库 HTTP 接口（GET，AI 通过 web_fetch 可调用）
+app.get('/memory', async (req, res) => {
+  const { key, value, action } = req.query;
+  try {
+    if (action === 'list') {
+      const data = await memoryList();
+      return res.json({ success: true, data });
+    }
+    if (action === 'delete') {
+      if (!key) return res.status(400).json({ error: '需要 key' });
+      await memoryDelete(key);
+      return res.json({ success: true });
+    }
+    if (value) {
+      await memorySet(key, value);
+      return res.json({ success: true, action: 'saved', key, value });
+    }
+    if (key) {
+      const val = await memoryGet(key);
+      return res.json({ success: true, key, value: val });
+    }
+    res.status(400).json({ error: '需要 key 或 action 参数' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // AI 写代码接口
 app.post('/write', express.json(), async (req, res) => {
   const { files, message } = req.body;
