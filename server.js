@@ -264,6 +264,45 @@ app.all('/mcp', async (req, res) => {
   await transport.handleRequest(req, res, body);
 });
 
+// AI 写代码接口
+app.post('/write', express.json(), async (req, res) => {
+  const { files, message } = req.body;
+  if (!files || !Array.isArray(files)) {
+    return res.status(400).json({ error: '需要 files 数组' });
+  }
+  try {
+    const branch = 'main';
+    const ref = await gh('GET', `/repos/${GITHUB_OWNER}/deeplink/git/ref/heads/${branch}`);
+    const latestCommit = await gh('GET', `/repos/${GITHUB_OWNER}/deeplink/git/commits/${ref.object.sha}`);
+    const blobs = await Promise.all(files.map(f =>
+      gh('POST', `/repos/${GITHUB_OWNER}/deeplink/git/blobs`, {
+        content: f.content,
+        encoding: 'utf-8',
+      })
+    ));
+    const newTree = await gh('POST', `/repos/${GITHUB_OWNER}/deeplink/git/trees`, {
+      base_tree: latestCommit.tree.sha,
+      tree: files.map((f, i) => ({
+        path: f.path,
+        mode: '100644',
+        type: 'blob',
+        sha: blobs[i].sha,
+      })),
+    });
+    const newCommit = await gh('POST', `/repos/${GITHUB_OWNER}/deeplink/git/commits`, {
+      message: message || 'DeepSeek 自动提交',
+      tree: newTree.sha,
+      parents: [latestCommit.sha],
+    });
+    await gh('PATCH', `/repos/${GITHUB_OWNER}/deeplink/git/refs/heads/${branch}`, {
+      sha: newCommit.sha,
+    });
+    res.json({ success: true, commit: newCommit.sha, files: files.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ DeepSeek-GitHub MCP running on port ${PORT}`);
