@@ -1,114 +1,270 @@
-const WebSocket = require('ws');
-const http = require('http');
-const url = require('url');
+const express = require('express');
+const cors = require('cors');
+const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+const {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} = require('@modelcontextprotocol/sdk/types.js');
 
-const PORT = process.env.PORT || 8080;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'meng819';
 
-const server = http.createServer((req, res) => {
-    // 设置CORS
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+if (!GITHUB_TOKEN) {
+  console.error('❌ 缺少 GITHUB_TOKEN 环境变量');
+  process.exit(1);
+}
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204);
-        res.end();
-        return;
-    }
+// GitHub API 封装
+async function gh(method, path, body) {
+  const url = `https://api.github.com${path}`;
+  const opts = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'deeplink-mcp/1.0',
+    },
+  };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  const data = await res.json();
+  if (!res.ok) throw new Error(`GitHub API: ${res.status} ${JSON.stringify(data)}`);
+  return data;
+}
 
-    const parsedUrl = url.parse(req.url, true);
-    const path = parsedUrl.pathname;
+// 工具列表
+const TOOLS = [
+  {
+    name: 'create_repo',
+    description: '创建一个新的 GitHub 仓库',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '仓库名' },
+        description: { type: 'string', description: '仓库描述' },
+        is_private: { type: 'boolean', description: '是否私有', default: true },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'list_repos',
+    description: '列出账号下所有仓库',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        per_page: { type: 'number', default: 30 },
+        page: { type: 'number', default: 1 },
+      },
+    },
+  },
+  {
+    name: 'list_files',
+    description: '查看仓库目录结构',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: '仓库名' },
+        path: { type: 'string', description: '路径，默认根目录' },
+        recursive: { type: 'boolean', description: '是否递归', default: false },
+        branch: { type: 'string', description: '分支，默认 main' },
+      },
+      required: ['repo'],
+    },
+  },
+  {
+    name: 'get_file',
+    description: '读取仓库中某个文件的内容',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: '仓库名' },
+        path: { type: 'string', description: '文件路径' },
+        branch: { type: 'string', description: '分支，默认 main' },
+      },
+      required: ['repo', 'path'],
+    },
+  },
+  {
+    name: 'push_files',
+    description: '批量推送文件到仓库',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: '仓库名' },
+        message: { type: 'string', description: 'commit 信息' },
+        files: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: '文件路径' },
+              content: { type: 'string', description: '文件内容' },
+            },
+            required: ['path', 'content'],
+          },
+        },
+        branch: { type: 'string', description: '分支，默认 main' },
+      },
+      required: ['repo', 'message', 'files'],
+    },
+  },
+];
 
-    if (req.method === 'GET' && path === '/') {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ status: 'running', phoneConnected: phoneClient !== null }));
-        return;
-    }
+// MCP Server
+const mcpServer = new Server(
+  { name: 'deeplink-github', version: '1.0.0' },
+  { capabilities: { tools: {} } }
+);
 
-    if (req.method === 'POST' && path === '/command') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', () => {
-            try {
-                const data = JSON.parse(body);
-                
-                if (!phoneClient || phoneClient.readyState !== WebSocket.OPEN) {
-                    res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
-                    res.end(JSON.stringify({ success: false, error: '手机未连接' }));
-                    return;
-                }
+mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
+}));
 
-                const command = {
-                    type: 'command',
-                    command: data
-                };
-
-                phoneClient.send(JSON.stringify(command));
-                
-                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify({ success: true, message: '指令已发送' }));
-            } catch (e) {
-                res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify({ success: false, error: e.message }));
-            }
+mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+  
+  try {
+    let result;
+    switch (name) {
+      case 'create_repo':
+        result = await gh('POST', '/user/repos', {
+          name: args.name,
+          description: args.description || '',
+          private: args.is_private !== false,
         });
-        return;
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            name: result.name,
+            url: result.html_url,
+            private: result.private,
+          }, null, 2) }],
+        };
+
+      case 'list_repos':
+        result = await gh('GET', `/user/repos?per_page=${args.per_page || 30}&page=${args.page || 1}&sort=updated`);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(
+            result.map(r => ({
+              name: r.name,
+              private: r.private,
+              url: r.html_url,
+              updated: r.updated_at,
+            })), null, 2
+          ) }],
+        };
+
+      case 'list_files': {
+        const branch = args.branch || 'main';
+        const path = args.path || '';
+        const recursive = args.recursive ? '&recursive=1' : '';
+        result = await gh('GET', `/repos/${GITHUB_OWNER}/${args.repo}/git/trees/${branch}${recursive}`);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(
+            result.tree.filter(f => {
+              if (path) return f.path.startsWith(path);
+              return !f.path.includes('/');
+            }).map(f => ({
+              path: f.path,
+              type: f.type,
+              mode: f.mode,
+            })), null, 2
+          ) }],
+        };
+      }
+
+      case 'get_file': {
+        const branch = args.branch || 'main';
+        result = await gh('GET', `/repos/${GITHUB_OWNER}/${args.repo}/contents/${args.path}?ref=${branch}`);
+        const content = Buffer.from(result.content, 'base64').toString('utf-8');
+        return {
+          content: [{ type: 'text', text: content }],
+        };
+      }
+
+      case 'push_files': {
+        const branch = args.branch || 'main';
+        // 获取最新 commit
+        const ref = await gh('GET', `/repos/${GITHUB_OWNER}/${args.repo}/git/ref/heads/${branch}`);
+        const latestCommit = await gh('GET', `/repos/${GITHUB_OWNER}/${args.repo}/git/commits/${ref.object.sha}`);
+        
+        // 为每个文件创建 blob
+        const blobs = await Promise.all(args.files.map(f =>
+          gh('POST', `/repos/${GITHUB_OWNER}/${args.repo}/git/blobs`, {
+            content: f.content,
+            encoding: 'utf-8',
+          })
+        ));
+        
+        // 创建新的 tree
+        const newTree = await gh('POST', `/repos/${GITHUB_OWNER}/${args.repo}/git/trees`, {
+          base_tree: latestCommit.tree.sha,
+          tree: args.files.map((f, i) => ({
+            path: f.path,
+            mode: '100644',
+            type: 'blob',
+            sha: blobs[i].sha,
+          })),
+        });
+        
+        // 创建 commit
+        const newCommit = await gh('POST', `/repos/${GITHUB_OWNER}/${args.repo}/git/commits`, {
+          message: args.message,
+          tree: newTree.sha,
+          parents: [latestCommit.sha],
+        });
+        
+        // 更新分支引用
+        await gh('PATCH', `/repos/${GITHUB_OWNER}/${args.repo}/git/refs/heads/${branch}`, {
+          sha: newCommit.sha,
+        });
+        
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            success: true,
+            commit: newCommit.sha,
+            files: args.files.length,
+          }, null, 2) }],
+        };
+      }
+
+      default:
+        throw new Error(`未知工具: ${name}`);
     }
-
-    res.writeHead(404);
-    res.end('Not Found');
+  } catch (error) {
+    return {
+      content: [{ type: 'text', text: `错误: ${error.message}` }],
+      isError: true,
+    };
+  }
 });
 
-const wss = new WebSocket.Server({ server });
+// Express 服务
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-let phoneClient = null;
-
-wss.on('connection', (ws, req) => {
-    console.log('新连接来自:', req.socket.remoteAddress);
-
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message.toString());
-            console.log('收到消息:', data.type);
-
-            switch (data.type) {
-                case 'register':
-                    if (data.package === 'com.deeplink.control') {
-                        phoneClient = ws;
-                        console.log('手机已连接');
-                        ws.send(JSON.stringify({ type: 'registered', status: 'ok' }));
-                    }
-                    break;
-
-                case 'foreground_response':
-                    console.log('前台应用:', data.package);
-                    break;
-
-                case 'pong':
-                    break;
-
-                default:
-                    console.log('未知消息类型:', data.type);
-            }
-        } catch (e) {
-            console.error('消息解析失败:', e.message);
-        }
-    });
-
-    ws.on('close', () => {
-        if (ws === phoneClient) {
-            phoneClient = null;
-            console.log('手机断开连接');
-        }
-    });
-
-    ws.on('error', (err) => {
-        console.error('连接错误:', err.message);
-    });
+// 健康检查
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', owner: GITHUB_OWNER });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`DeepLink Control 服务器 v2 已启动`);
-    console.log(`监听端口: ${PORT}`);
-    console.log(`HTTP API: http://0.0.0.0:${PORT}/command (POST)`);
+// MCP Streamable HTTP
+app.all('/mcp', async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({
+    sessionId: req.headers['mcp-session-id'] || '',
+  });
+  await mcpServer.connect(transport);
+  
+  const body = req.method === 'GET' ? undefined : req.body;
+  await transport.handleRequest(req, res, body);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ DeepSeek-GitHub MCP running on port ${PORT}`);
 });
