@@ -129,5 +129,6 @@ app.get('/memory', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+require('./xhs-route.js');
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`DeepSeek running on port ${PORT}`));
