@@ -1,0 +1,45 @@
+const express = require('express');
+const cors = require('cors');
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'meng819';
+async function gh(method, path, body) {
+  const url = `https://api.github.com${path}`;
+  const opts = { method, headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github json', 'User-Agent': 'deeplink-mcp/1.0' } };
+  if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  const res = await fetch(url, opts); const data = await res.json();
+  if (!res.ok) throw new Error(`GitHub API: ${res.status}`); return data;
+}
+const app = express();
+app.use(cors()); app.use(express.json());
+app.get('/health', (req, res) => res.json({ status: 'ok', owner: GITHUB_OWNER }));
+app.get('/gh', async (req, res) => {
+  const { path, content, message, action } = req.query;
+  if (action === 'delete') {
+    if (!path) return res.status(400).json({ error: '需要 path' });
+    try {
+      const dp = decodeURIComponent(path);
+      const dm = decodeURIComponent(message || 'DeepSeek 删除');
+      const info = await gh('GET', `/repos/${GITHUB_OWNER}/deeplink/contents/${dp}?ref=main`);
+      await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/deeplink/contents/${dp}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Content-Type': 'application/json', 'User-Agent': 'deeplink/1.0' },
+        body: JSON.stringify({ message: dm, sha: info.sha, branch: 'main' }),
+      });
+      return res.json({ success: true, path: dp });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
+  if (!path || !content) return res.status(400).json({ error: '需要 path 和 content' });
+  try {
+    const ref = await gh('GET', `/repos/${GITHUB_OWNER}/deeplink/git/ref/heads/main`);
+    const lc = await gh('GET', `/repos/${GITHUB_OWNER}/deeplink/git/commits/${ref.object.sha}`);
+    const blob = await gh('POST', `/repos/${GITHUB_OWNER}/deeplink/git/blobs`, { content: decodeURIComponent(content), encoding: 'utf-8' });
+    const nt = await gh('POST', `/repos/${GITHUB_OWNER}/deeplink/git/trees`, { base_tree: lc.tree.sha, tree: [{ path: decodeURIComponent(path), mode: '100644', type: 'blob', sha: blob.sha }] });
+    const nc = await gh('POST', `/repos/${GITHUB_OWNER}/deeplink/git/commits`, { message: decodeURIComponent(message || 'DeepSeek 提交'), tree: nt.sha, parents: [lc.sha] });
+    await gh('PATCH', `/repos/${GITHUB_OWNER}/deeplink/git/refs/heads/main`, { sha: nc.sha });
+    res.json({ success: true, commit: nc.sha, path: decodeURIComponent(path) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+const SU = process.env.SUPABASE_URL || 'https://notkmhfkdhpbfnwsgcwl.supabase.co';
+const SK = process.env.SUPABASE_KEY || 'sb_publishable_1nU61MBGaBcJWB6sATWaxQ_cyalHUea';
+async function mGet(key) {
+  const r = await fetch(`${SU}/rest/v1/memories?key=eq.${encodeURIComponent(key)}
